@@ -190,6 +190,26 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
     return type;
   }
 
+  protected Long splitSize() {
+    return splitSize;
+  }
+
+  protected Integer splitLookback() {
+    return splitLookback;
+  }
+
+  protected Long splitOpenFileCost() {
+    return splitOpenFileCost;
+  }
+
+  protected boolean caseSensitive() {
+    return caseSensitive;
+  }
+
+  protected List<Expression> filterExpressions() {
+    return filterExpressions;
+  }
+
   @Override
   public StructType readSchema() {
     return lazyType();
@@ -338,7 +358,7 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
         .forEach(key -> baseConf.set(key.replaceFirst("hadoop.", ""), options.get(key)));
   }
 
-  private List<CombinedScanTask> tasks() {
+  protected List<CombinedScanTask> tasks() {
     if (tasks == null) {
       TableScan scan = table
           .newScan()
