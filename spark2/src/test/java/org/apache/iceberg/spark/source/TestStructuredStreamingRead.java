@@ -19,21 +19,24 @@
 
 package org.apache.iceberg.spark.source;
 
-import java.io.File;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Collections;
-import java.util.List;
-import java.util.Optional;
-import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.iceberg.AssertHelpers;
+import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.iceberg.*;
 import org.apache.iceberg.MicroBatches.MicroBatch;
-import org.apache.iceberg.PartitionSpec;
-import org.apache.iceberg.Schema;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.hadoop.HadoopTables;
+import org.apache.iceberg.avro.Avro;
+import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.RandomGenericData;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.avro.DataWriter;
+import org.apache.iceberg.data.orc.GenericOrcWriter;
+import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.hive.HiveCatalog;
+import org.apache.iceberg.hive.HiveCatalogs;
+import org.apache.iceberg.hive.TestHiveMetastore;
+import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.orc.ORC;
+import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -42,59 +45,83 @@ import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.functions;
 import org.apache.spark.sql.sources.v2.DataSourceOptions;
-import org.junit.AfterClass;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Rule;
-import org.junit.Test;
+import org.apache.spark.sql.streaming.StreamingQueryException;
+import org.apache.spark.sql.streaming.Trigger;
+import org.junit.*;
 import org.junit.rules.ExpectedException;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
 import static org.apache.iceberg.types.Types.NestedField.optional;
+import static org.apache.iceberg.types.Types.NestedField.required;
 
 public class TestStructuredStreamingRead {
   private static final Configuration CONF = new Configuration();
   private static final Schema SCHEMA = new Schema(
       optional(1, "id", Types.IntegerType.get()),
-      optional(2, "data", Types.StringType.get())
+      optional(2, "data", Types.StringType.get()),
+      required(3, "ts", Types.TimestampType.withZone())
   );
   private static SparkSession spark = null;
   private static Path parent = null;
   private static File tableLocation = null;
   private static Table table = null;
 
+  private static TestHiveMetastore metastore;
+
   @Rule
   public ExpectedException exceptionRule = ExpectedException.none();
 
   @BeforeClass
   public static void startSpark() throws Exception {
+    metastore = new TestHiveMetastore();
+    metastore.start();
+    HiveConf conf = metastore.hiveConf();
+
+    String metastoreURI = conf.get(HiveConf.ConfVars.METASTOREURIS.varname);
+    // Create a spark session.
     TestStructuredStreamingRead.spark = SparkSession.builder()
-        .master("local[2]")
-        .config("spark.sql.shuffle.partitions", 4)
-        .getOrCreate();
+            .enableHiveSupport()
+            .config("spark.hadoop.hive.metastore.uris", metastoreURI)
+            .master("local[2]")
+            .config("spark.sql.shuffle.partitions", 4)
+            .getOrCreate();
 
     parent = Files.createTempDirectory("test");
-    tableLocation = new File(parent.toFile(), "table");
-    tableLocation.mkdir();
 
-    HadoopTables tables = new HadoopTables(CONF);
+    HiveCatalog tables = HiveCatalogs.loadCatalog(conf);
     PartitionSpec spec = PartitionSpec.builderFor(SCHEMA).identity("data").build();
-    table = tables.create(SCHEMA, spec, tableLocation.toString());
+    table = tables.createTable(TableIdentifier.of("default", "t"), SCHEMA, spec);
 
-    List<List<SimpleRecord>> expected = Lists.newArrayList(
-        Lists.newArrayList(new SimpleRecord(1, "1")),
-        Lists.newArrayList(new SimpleRecord(2, "2")),
-        Lists.newArrayList(new SimpleRecord(3, "3")),
-        Lists.newArrayList(new SimpleRecord(4, "4"))
+    List<List<SimpleRecord2>> expected = Lists.newArrayList(
+        Lists.newArrayList(new SimpleRecord2(1, "1", 45L)),
+        Lists.newArrayList(new SimpleRecord2(2, "2", 100L)),
+        Lists.newArrayList(new SimpleRecord2(3, "3", 150L)),
+        Lists.newArrayList(new SimpleRecord2(4, "4", 200L))
     );
 
     // Write records one by one to generate 4 snapshots.
-    for (List<SimpleRecord> l : expected) {
-      Dataset<Row> df = spark.createDataFrame(l, SimpleRecord.class);
-      df.select("id", "data").write()
+    for (List<SimpleRecord2> l : expected) {
+      Dataset<Row> df = spark.createDataFrame(l, SimpleRecord2.class);
+      df.select("id", "data")
+        .withColumn("ts", functions.current_timestamp())
+        .write()
         .format("iceberg")
         .mode("append")
-        .save(tableLocation.toString());
+        .save("default.t");
     }
     table.refresh();
   }
@@ -104,6 +131,36 @@ public class TestStructuredStreamingRead {
     SparkSession currentSpark = TestStructuredStreamingRead.spark;
     TestStructuredStreamingRead.spark = null;
     currentSpark.stop();
+  }
+
+  @Test
+  public void sparkDataStream() throws StreamingQueryException {
+    ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
+    AtomicReference<Integer> i = new AtomicReference<>(0);
+    executorService.scheduleWithFixedDelay(
+            () -> {
+              System.out.println("Writing records in the table");
+              List<Record> records = RandomGenericData.generate(SCHEMA, 10, 0L);
+              records.forEach(r -> r.set(1, i.toString()));
+              DataFile dataFile = writeFile(TestHelpers.Row.of(i.toString()), records);
+              table.newAppend().appendFile(dataFile).commit();
+              i.updateAndGet(v -> v + 1);
+            },
+            0,
+            1,
+            TimeUnit.MINUTES
+    );
+    Dataset<Row> df = spark.readStream().format("iceberg").load("default.t");
+    Dataset<Row> id = df
+            .withWatermark("ts", "1 minutes")
+            //.groupBy(functions.window(df.col("ts"), "1 minutes"))
+            .groupBy("ts")
+            .count();
+    id.writeStream()
+            .format("console")
+            .trigger(Trigger.Once())
+            .start()
+            .awaitTermination();
   }
 
   @SuppressWarnings("unchecked")
@@ -178,7 +235,6 @@ public class TestStructuredStreamingRead {
   @Test
   public void testGetChangesFromLastSnapshot() throws IOException {
     File checkpoint = Files.createTempDirectory(parent, "checkpoint").toFile();
-
     DataSourceOptions options = new DataSourceOptions(ImmutableMap.of(
         "path", tableLocation.toString(),
         "checkpointLocation", checkpoint.toString()));
@@ -485,5 +541,67 @@ public class TestStructuredStreamingRead {
     StreamingOffset end3 = (StreamingOffset) streamingReader.getEndOffset();
     Assert.assertEquals("End offset should be same to start offset since there's no more batches to consume",
         end2, end3);
+  }
+
+  public DataFile writeFile(StructLike partition, List<Record> records) {
+    Preconditions.checkNotNull(table, "table not set");
+    try {
+      return writeFile(table, partition, records, FileFormat.PARQUET, parent.toFile());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public static DataFile writeFile(Table table, StructLike partition, List<Record> records, FileFormat fileFormat,
+                                   File file) throws IOException {
+    Assert.assertTrue(file.delete());
+
+    FileAppender<Record> appender;
+
+    switch (fileFormat) {
+      case AVRO:
+        appender = Avro.write(org.apache.iceberg.Files.localOutput(file))
+                .schema(table.schema())
+                .createWriterFunc(DataWriter::create)
+                .named(fileFormat.name())
+                .build();
+        break;
+
+      case PARQUET:
+        appender = Parquet.write(org.apache.iceberg.Files.localOutput(file))
+                .schema(table.schema())
+                .createWriterFunc(GenericParquetWriter::buildWriter)
+                .named(fileFormat.name())
+                .build();
+        break;
+
+      case ORC:
+        appender = ORC.write(org.apache.iceberg.Files.localOutput(file))
+                .schema(table.schema())
+                .createWriterFunc(GenericOrcWriter::buildWriter)
+                .build();
+        break;
+
+      default:
+        throw new UnsupportedOperationException("Cannot write format: " + fileFormat);
+    }
+
+    try {
+      appender.addAll(records);
+    } finally {
+      appender.close();
+    }
+
+    DataFiles.Builder builder = DataFiles.builder(table.spec())
+            .withPath(file.toString())
+            .withFormat(fileFormat)
+            .withFileSizeInBytes(file.length())
+            .withMetrics(appender.metrics());
+
+    if (partition != null) {
+      builder.withPartition(partition);
+    }
+
+    return builder.build();
   }
 }
