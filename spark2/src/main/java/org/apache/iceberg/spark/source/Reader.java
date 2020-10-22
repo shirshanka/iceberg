@@ -128,7 +128,7 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
     }
 
     // look for split behavior overrides in options
-    this.splitSize = options.get("split-size").map(Long::parseLong).orElse(null);
+    this.splitSize = options.get("split-size").map(Long::parseLong).orElse(TableProperties.SPLIT_SIZE_DEFAULT);
     this.splitLookback = options.get("lookback").map(Integer::parseInt).orElse(null);
     this.splitOpenFileCost = options.get("file-open-cost").map(Long::parseLong).orElse(null);
 
@@ -188,6 +188,26 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
       this.type = SparkSchemaUtil.convert(lazySchema());
     }
     return type;
+  }
+
+  protected Long splitSize() {
+    return splitSize;
+  }
+
+  protected Integer splitLookback() {
+    return splitLookback;
+  }
+
+  protected Long splitOpenFileCost() {
+    return splitOpenFileCost;
+  }
+
+  protected boolean caseSensitive() {
+    return caseSensitive;
+  }
+
+  protected List<Expression> filterExpressions() {
+    return filterExpressions;
   }
 
   @Override
@@ -338,7 +358,7 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
         .forEach(key -> baseConf.set(key.replaceFirst("hadoop.", ""), options.get(key)));
   }
 
-  private List<CombinedScanTask> tasks() {
+  protected List<CombinedScanTask> tasks() {
     if (tasks == null) {
       TableScan scan = table
           .newScan()
