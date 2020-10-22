@@ -134,33 +134,39 @@ public class TestStructuredStreamingRead {
   }
 
   @Test
-  public void sparkDataStream() throws StreamingQueryException {
+  public void sparkDataStream()
+      throws StreamingQueryException, InterruptedException {
     ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
     AtomicReference<Integer> i = new AtomicReference<>(0);
-    executorService.scheduleWithFixedDelay(
-            () -> {
-              System.out.println("Writing records in the table");
-              List<Record> records = RandomGenericData.generate(SCHEMA, 10, 0L);
-              records.forEach(r -> r.set(1, i.toString()));
-              DataFile dataFile = writeFile(TestHelpers.Row.of(i.toString()), records);
-              table.newAppend().appendFile(dataFile).commit();
-              i.updateAndGet(v -> v + 1);
-            },
-            0,
-            1,
-            TimeUnit.MINUTES
-    );
+    //executorService.scheduleWithFixedDelay(() -> {
+    //  addSomeData(i);
+    //}, 0, 1, TimeUnit.MINUTES);
+    //Thread.sleep(1000);
+    runOneBatch();
+    addSomeData(i);
+    //Thread.sleep(1000*120);
+    runOneBatch();
+  }
+
+  private void addSomeData(AtomicReference<Integer> i) {
+    System.out.println("Writing records in the table");
+    List<Record> records = RandomGenericData.generate(SCHEMA, 10, 0L);
+    records.forEach(r -> r.set(1, i.toString()));
+    records.forEach(r -> System.out.println(r.toString()));
+    DataFile dataFile = writeFile(TestHelpers.Row.of(i.toString()), records);
+    table.newAppend().appendFile(dataFile).commit();
+    i.updateAndGet(v -> v + 1);
+  }
+
+  private void runOneBatch()
+      throws StreamingQueryException {
     Dataset<Row> df = spark.readStream().format("iceberg").load("default.t");
-    Dataset<Row> id = df
-            .withWatermark("ts", "1 minutes")
-            //.groupBy(functions.window(df.col("ts"), "1 minutes"))
-            .groupBy("ts")
-            .count();
-    id.writeStream()
-            .format("console")
-            .trigger(Trigger.Once())
-            .start()
-            .awaitTermination();
+    Dataset<Row> id = df.withWatermark("ts", "1 minutes").groupBy(functions.window(df.col("ts"), "1 minutes"))
+        //.groupBy("ts")
+        .count();
+//    id.writeStream().format("console").outputMode("complete").start().awaitTermination();
+
+    id.writeStream().outputMode("complete").format("console").trigger(Trigger.Once()).start().awaitTermination();
   }
 
   @SuppressWarnings("unchecked")

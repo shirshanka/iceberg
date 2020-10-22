@@ -176,17 +176,19 @@ class StreamingReader extends Reader implements MicroBatchReader {
 
     MicroBatch lastBatch = pendingBatches.get(pendingBatches.size() - 1);
     Preconditions.checkState(
-        lastBatch.snapshotId() != endOffset.snapshotId() || lastBatch.endFileIndex() != endOffset.index(),
+        lastBatch.snapshotId() == endOffset.snapshotId() && lastBatch.endFileIndex() == endOffset.index(),
         "The cached pendingBatches doesn't match the current end offset " + endOffset);
 
     LOG.info("Processing data from {} to {}", startOffset, endOffset);
     List<FileScanTask> tasks = pendingBatches.stream()
         .flatMap(batch -> batch.tasks().stream())
         .collect(Collectors.toList());
+    LOG.info("Tasks {}", tasks);
+    //Long splitSize = splitSize();
     CloseableIterable<FileScanTask> splitTasks = TableScanUtil.splitFiles(CloseableIterable.withNoopClose(tasks),
         splitSize());
     return Lists.newArrayList(
-        TableScanUtil.planTasks(splitTasks, splitSize, splitLookback, splitOpenFileCost));
+        TableScanUtil.planTasks(splitTasks, splitSize(), splitLookback, splitOpenFileCost));
   }
 
   private StreamingOffset calculateStartingOffset() {

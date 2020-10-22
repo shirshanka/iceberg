@@ -128,7 +128,7 @@ class Reader implements DataSourceReader, SupportsScanColumnarBatch, SupportsPus
     }
 
     // look for split behavior overrides in options
-    this.splitSize = options.get("split-size").map(Long::parseLong).orElse(null);
+    this.splitSize = options.get("split-size").map(Long::parseLong).orElse(TableProperties.SPLIT_SIZE_DEFAULT);
     this.splitLookback = options.get("lookback").map(Integer::parseInt).orElse(null);
     this.splitOpenFileCost = options.get("file-open-cost").map(Long::parseLong).orElse(null);
 
